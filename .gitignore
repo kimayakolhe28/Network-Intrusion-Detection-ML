@@ -1,0 +1,16 @@
+# Raw CICIDS2017 dataset
+data/raw/*.csv
+
+# Jupyter checkpoints
+notebooks/.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables
+.env
