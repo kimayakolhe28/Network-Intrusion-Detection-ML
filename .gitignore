@@ -1,22 +1,30 @@
 # Raw CICIDS2017 dataset
-data/raw/*.csv
+data/raw/
 
-# Processed data
+# Processed/generated dataset
 data/processed/
 
+# Live captures / PCAPs
+data/live/
+
+# Notebook-generated data
+notebooks/data/
+
 # Jupyter checkpoints
-notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
 
 # Python cache
 __pycache__/
+*.pyc
+*.pyo
 *.py[cod]
 
 # Virtual environments
-.venv/
 venv/
+.venv/
 
 # Environment variables
 .env
 
-# Model files
+# Large baseline model
 models/rf_baseline.joblib
