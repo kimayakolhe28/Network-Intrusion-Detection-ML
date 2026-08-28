@@ -1,6 +1,9 @@
 # Raw CICIDS2017 dataset
 data/raw/*.csv
 
+# Processed data
+data/processed/
+
 # Jupyter checkpoints
 notebooks/.ipynb_checkpoints/
 
@@ -14,3 +17,6 @@ venv/
 
 # Environment variables
 .env
+
+# Model files
+models/rf_baseline.joblib
