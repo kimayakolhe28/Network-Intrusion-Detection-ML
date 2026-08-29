@@ -14,9 +14,13 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
-# Import scapy and cicflowmeter
+# Scapy is used to capture packets.  We deliberately do not use the Python
+# ``cicflowmeter`` package as the feature authority: it counts whole Scapy
+# packets (IP/TCP headers included) as packet bytes and adds the first packet
+# twice.  That is incompatible with the CICFlowMeter CSV semantics used by the
+# Week 1--3 CICIDS2017 training data.
 from scapy.sendrecv import sniff, AsyncSniffer
-from cicflowmeter.flow_session import FlowSession
+from scapy.layers.inet import IP, TCP, UDP
 
 # Default rename dictionary mapping cicflowmeter output columns (snake_case)
 # to CICIDS2017 standard dataset column names (Title Case)
@@ -100,9 +104,203 @@ CICFLOWMETER_RENAME_MAP = {
     'idle_min': 'Idle Min',
 }
 
+
+def _stats(values):
+    """CICFlowMeter SummaryStatistics values, with zero for empty input."""
+    if not values:
+        return {"total": 0.0, "mean": 0.0, "std": 0.0, "max": 0.0, "min": 0.0}
+    arr = np.asarray(values, dtype=float)
+    return {
+        "total": float(arr.sum()), "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=1)) if arr.size > 1 else 0.0, "max": float(arr.max()),
+        "min": float(arr.min()),
+    }
+
+
+def _packet_payload_length(packet):
+    """Return L4 payload bytes, the length basis in the CICIDS CSVs."""
+    if TCP in packet:
+        return len(bytes(packet[TCP].payload))
+    if UDP in packet:
+        return len(bytes(packet[UDP].payload))
+    return 0
+
+
+def _packet_header_length(packet):
+    """Return IPv4 + transport-header bytes (not frame bytes or payload)."""
+    ip_len = int(packet[IP].ihl or 5) * 4 if IP in packet else 0
+    if TCP in packet:
+        return ip_len + int(packet[TCP].dataofs or 5) * 4
+    if UDP in packet:
+        return ip_len + 8
+    return ip_len
+
+
+def _flag_count(packets, flag, direction=None):
+    """Count a TCP flag across all packets or one flow direction."""
+    return sum(
+        1 for packet, packet_direction in packets
+        if TCP in packet and (direction is None or packet_direction == direction)
+        and flag in packet[TCP].sprintf("%TCP.flags%")
+    )
+
+
+def _active_idle_stats(times):
+    """Compute CICFlowMeter active/idle periods using its five-second timeout."""
+    if len(times) < 2:
+        return _stats([]), _stats([])
+    active, idle = [], []
+    active_start = last = times[0]
+    for current in times[1:]:
+        if current - last > 5.0:
+            active.append(last - active_start)
+            idle.append(current - last)
+            active_start = current
+        last = current
+    # CICFlowMeter emits no active/idle record unless a clump boundary occurs.
+    return _stats(active), _stats(idle)
+
+
+def _bulk_features(packets, direction):
+    """CICFlowMeter bulk metrics (a bulk starts at four payload packets)."""
+    payload_packets = [
+        (float(packet.time), _packet_payload_length(packet))
+        for packet, packet_direction in packets
+        if packet_direction == direction and _packet_payload_length(packet) > 0
+    ]
+    groups, current = [], []
+    for item in payload_packets:
+        if current and item[0] - current[-1][0] > 1.0:
+            if len(current) >= 4:
+                groups.append(current)
+            current = []
+        current.append(item)
+    if len(current) >= 4:
+        groups.append(current)
+    if not groups:
+        return 0.0, 0.0, 0.0
+    sizes = [sum(value for _, value in group) for group in groups]
+    counts = [len(group) for group in groups]
+    durations = [group[-1][0] - group[0][0] for group in groups]
+    total_duration = sum(durations)
+    return (
+        float(np.mean(sizes)), float(np.mean(counts)),
+        float(sum(sizes) / total_duration) if total_duration else 0.0,
+    )
+
+
+def _flow_record(packets):
+    """Create one raw CICFlowMeter-compatible record from ordered packets."""
+    first, _ = packets[0]
+    forward = [(packet, direction) for packet, direction in packets if direction == "fwd"]
+    backward = [(packet, direction) for packet, direction in packets if direction == "bwd"]
+    fwd_lengths = [_packet_payload_length(packet) for packet, _ in forward]
+    bwd_lengths = [_packet_payload_length(packet) for packet, _ in backward]
+    all_lengths = fwd_lengths + bwd_lengths
+    times = [float(packet.time) for packet, _ in packets]
+    duration = max(times) - min(times)
+    iats = [right - left for left, right in zip(times, times[1:])]
+    fwd_times = [float(packet.time) for packet, _ in forward]
+    bwd_times = [float(packet.time) for packet, _ in backward]
+    fwd_iats = [right - left for left, right in zip(fwd_times, fwd_times[1:])]
+    bwd_iats = [right - left for left, right in zip(bwd_times, bwd_times[1:])]
+    fwd_stat, bwd_stat = _stats(fwd_lengths), _stats(bwd_lengths)
+    # BasicFlow.firstPacket adds the initiating forward payload to
+    # flowLengthStats twice.  This historical behaviour is part of the
+    # CICIDS2017 feature semantics, so retain it for compatibility.
+    flow_lengths = ([fwd_lengths[0]] if fwd_lengths else []) + all_lengths
+    all_stat = _stats(flow_lengths)
+    iat_stat, fwd_iat_stat, bwd_iat_stat = _stats(iats), _stats(fwd_iats), _stats(bwd_iats)
+    active_stat, idle_stat = _active_idle_stats(times)
+    fwd_bulk = _bulk_features(packets, "fwd")
+    bwd_bulk = _bulk_features(packets, "bwd")
+    fwd_headers = sum(_packet_header_length(packet) for packet, _ in forward)
+    bwd_headers = sum(_packet_header_length(packet) for packet, _ in backward)
+    fwd_min_header = min((_packet_header_length(packet) for packet, _ in forward), default=0)
+    total_payload = all_stat["total"]
+    rate = lambda value: float(value / duration) if duration > 0 else 0.0
+    return {
+        "src_ip": first[IP].src, "dst_ip": first[IP].dst,
+        "src_port": int(first.sport), "dst_port": int(first.dport),
+        "protocol": int(first[IP].proto),
+        "timestamp": datetime.fromtimestamp(times[0]).strftime("%Y-%m-%d %H:%M:%S"),
+        "flow_duration": duration, "flow_byts_s": rate(total_payload),
+        "flow_pkts_s": rate(len(packets)), "fwd_pkts_s": rate(len(forward)),
+        "bwd_pkts_s": rate(len(backward)), "tot_fwd_pkts": len(forward),
+        "tot_bwd_pkts": len(backward), "totlen_fwd_pkts": fwd_stat["total"],
+        "totlen_bwd_pkts": bwd_stat["total"],
+        "fwd_pkt_len_max": fwd_stat["max"], "fwd_pkt_len_min": fwd_stat["min"],
+        "fwd_pkt_len_mean": fwd_stat["mean"], "fwd_pkt_len_std": fwd_stat["std"],
+        "bwd_pkt_len_max": bwd_stat["max"], "bwd_pkt_len_min": bwd_stat["min"],
+        "bwd_pkt_len_mean": bwd_stat["mean"], "bwd_pkt_len_std": bwd_stat["std"],
+        "pkt_len_max": all_stat["max"], "pkt_len_min": all_stat["min"],
+        "pkt_len_mean": all_stat["mean"], "pkt_len_std": all_stat["std"],
+        "pkt_len_var": all_stat["std"] ** 2, "fwd_header_len": fwd_headers,
+        "bwd_header_len": bwd_headers, "fwd_seg_size_min": fwd_min_header,
+        # The original collector increments this only in addPacket(), not for
+        # the packet that creates the flow.
+        "fwd_act_data_pkts": sum(length > 0 for length in fwd_lengths[1:]),
+        "flow_iat_mean": iat_stat["mean"], "flow_iat_max": iat_stat["max"],
+        "flow_iat_min": iat_stat["min"], "flow_iat_std": iat_stat["std"],
+        "fwd_iat_tot": fwd_iat_stat["total"], "fwd_iat_max": fwd_iat_stat["max"],
+        "fwd_iat_min": fwd_iat_stat["min"], "fwd_iat_mean": fwd_iat_stat["mean"],
+        "fwd_iat_std": fwd_iat_stat["std"], "bwd_iat_tot": bwd_iat_stat["total"],
+        "bwd_iat_max": bwd_iat_stat["max"], "bwd_iat_min": bwd_iat_stat["min"],
+        "bwd_iat_mean": bwd_iat_stat["mean"], "bwd_iat_std": bwd_iat_stat["std"],
+        "fwd_psh_flags": _flag_count(packets, "P", "fwd"),
+        "bwd_psh_flags": _flag_count(packets, "P", "bwd"),
+        "fwd_urg_flags": _flag_count(packets, "U", "fwd"),
+        "bwd_urg_flags": _flag_count(packets, "U", "bwd"),
+        "fin_flag_cnt": _flag_count(packets, "F"), "syn_flag_cnt": _flag_count(packets, "S"),
+        "rst_flag_cnt": _flag_count(packets, "R"), "psh_flag_cnt": _flag_count(packets, "P"),
+        "ack_flag_cnt": _flag_count(packets, "A"), "urg_flag_cnt": _flag_count(packets, "U"),
+        "ece_flag_cnt": _flag_count(packets, "E"), "cwr_flag_count": _flag_count(packets, "C"),
+        "down_up_ratio": float(len(backward) / len(forward)) if forward else 0.0,
+        "pkt_size_avg": float(all_stat["total"] / len(packets)) if packets else 0.0,
+        "init_fwd_win_byts": int(first[TCP].window) if TCP in first else -1,
+        "init_bwd_win_byts": int(backward[0][0][TCP].window) if backward and TCP in backward[0][0] else -1,
+        "active_max": active_stat["max"], "active_min": active_stat["min"],
+        "active_mean": active_stat["mean"], "active_std": active_stat["std"],
+        "idle_max": idle_stat["max"], "idle_min": idle_stat["min"],
+        "idle_mean": idle_stat["mean"], "idle_std": idle_stat["std"],
+        "fwd_byts_b_avg": fwd_bulk[0], "fwd_pkts_b_avg": fwd_bulk[1],
+        "fwd_blk_rate_avg": fwd_bulk[2], "bwd_byts_b_avg": bwd_bulk[0],
+        "bwd_pkts_b_avg": bwd_bulk[1], "bwd_blk_rate_avg": bwd_bulk[2],
+        "fwd_seg_size_avg": fwd_stat["mean"], "bwd_seg_size_avg": bwd_stat["mean"],
+        "subflow_fwd_pkts": len(forward), "subflow_bwd_pkts": len(backward),
+        "subflow_fwd_byts": fwd_stat["total"], "subflow_bwd_byts": bwd_stat["total"],
+    }
+
+
+def _extract_cicids_compatible_flows(packets):
+    """Group TCP/UDP packets into bidirectional, first-packet-forward flows."""
+    flows, active = [], {}
+    for packet in packets:
+        if IP not in packet or (TCP not in packet and UDP not in packet):
+            continue
+        protocol = int(packet[IP].proto)
+        direct = (packet[IP].src, int(packet.sport), packet[IP].dst, int(packet.dport), protocol)
+        reverse = (packet[IP].dst, int(packet.dport), packet[IP].src, int(packet.sport), protocol)
+        if direct in active:
+            key, direction = direct, "fwd"
+        elif reverse in active:
+            key, direction = reverse, "bwd"
+        else:
+            key, direction = direct, "fwd"
+            active[key] = []
+        # Match CICFlowMeter's 120-second flow expiry without duplicating the
+        # first packet of a newly created flow.
+        if active[key] and float(packet.time) - float(active[key][-1][0].time) > 120.0:
+            flows.append(_flow_record(active[key]))
+            active[key] = []
+            direction = "fwd"
+        active[key].append((packet, direction))
+    flows.extend(_flow_record(flow_packets) for flow_packets in active.values() if flow_packets)
+    return pd.DataFrame(flows)
+
 def extract_flows_from_pcap(pcap_path, output_csv=None):
     """
-    Extract network flow features from a .pcap file using cicflowmeter FlowSession.
+    Extract CICIDS2017-compatible flow features from a .pcap file.
     Returns Pandas DataFrame of extracted raw flows.
     """
     if not os.path.exists(pcap_path):
@@ -116,17 +314,11 @@ def extract_flows_from_pcap(pcap_path, output_csv=None):
     # Ensure parent directory exists
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
 
-    # Instantiate cicflowmeter FlowSession
-    session = FlowSession(output_mode="csv", output=output_csv)
-
-    # Use scapy sniff in offline mode without extra BPF filters to avoid tcpdump dependencies
-    sniff(offline=pcap_path, prn=session.process, store=False)
-    session.flush_flows()
-
-    if not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0:
+    packets = sniff(offline=pcap_path, store=True)
+    flow_df = _extract_cicids_compatible_flows(packets)
+    if flow_df.empty:
         raise ValueError(f"No flows were generated from PCAP file: {pcap_path}")
-
-    flow_df = pd.read_csv(output_csv)
+    flow_df.to_csv(output_csv, index=False)
     print(f"[+] Extracted {len(flow_df)} flows from PCAP: {pcap_path}")
     return flow_df, output_csv
 
@@ -142,22 +334,18 @@ def extract_flows_live(interface, output_csv=None, packet_count=100, timeout=10)
         output_csv = f"data/live/live_flows_{timestamp}.csv"
 
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    session = FlowSession(output_mode="csv", output=output_csv)
-
     print(f"[*] Starting live packet capture on interface: {interface} (count={packet_count}, timeout={timeout}s)...")
     try:
-        sniff(iface=interface, prn=session.process, count=packet_count, timeout=timeout, store=False)
+        packets = sniff(iface=interface, count=packet_count, timeout=timeout, store=True)
     except Exception as e:
         print(f"[!] Warning during live capture: {e}")
         print("    If using Windows, make sure Npcap is installed in WinPcap API-compatible Mode.")
     
-    session.flush_flows()
-
-    if not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0:
+    flow_df = _extract_cicids_compatible_flows(packets) if 'packets' in locals() else pd.DataFrame()
+    if flow_df.empty:
         print(f"[!] No flows were captured on interface {interface} during the timeout window.")
         return pd.DataFrame(), output_csv
-
-    flow_df = pd.read_csv(output_csv)
+    flow_df.to_csv(output_csv, index=False)
     print(f"[+] Extracted {len(flow_df)} live flows from interface: {interface}")
     return flow_df, output_csv
 
